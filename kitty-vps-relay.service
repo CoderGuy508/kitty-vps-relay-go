@@ -1,0 +1,22 @@
+[Unit]
+Description=Kitty external VPS relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kittyrelay
+Group=kittyrelay
+WorkingDirectory=/opt/kitty-vps-relay
+EnvironmentFile=/etc/kitty-vps-relay.env
+ExecStart=/opt/kitty-vps-relay/kitty-vps-relay
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/kitty-vps-relay
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+# Replace relay.example.com with a DNS name pointed at the MassiveGrid VPS.
+# Caddy obtains and renews the TLS certificate, so Kitty connects via WSS.
+relay.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:10000
+	header {
+		-Server
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+	}
+}
