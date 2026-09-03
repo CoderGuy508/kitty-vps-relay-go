@@ -48,19 +48,26 @@ type config struct {
 	partnerUpstream       string
 }
 
-// relayTokenClaims is what a separate TOTP-authenticated service signs when
-// it wants to give a player a short-lived relay credential. exp is Unix time
-// in seconds; maxTunnels is capped server-side regardless of its value.
+// relayTokenClaims is the one-time, short-lived browser credential created by
+// the Kitty account service. It is deliberately separate from the partner
+// TOTP: the browser is allowed to receive this scoped ticket, but never the
+// partner secret or a TOTP derived from it. New account-service tickets use
+// millisecond Unix timestamps; the older bridge format used seconds, so both
+// are accepted during a safe migration.
 type relayTokenClaims struct {
+	Type        string `json:"typ"`
 	Audience   string `json:"aud"`
 	Subject    string `json:"sub"`
+	Nonce      string `json:"nonce"`
 	ExpiresAt  int64  `json:"exp"`
 	MaxTunnels int    `json:"maxTunnels"`
 }
 
 type relayPrincipal struct {
-	identity   string
-	maxTunnels int
+	identity      string
+	maxTunnels    int
+	ticketID      string
+	ticketExpires time.Time
 }
 
 type relayService struct {
@@ -69,8 +76,9 @@ type relayService struct {
 	upgrader websocket.Upgrader
 	dialer   websocket.Dialer
 
-	mu     sync.Mutex
-	active map[string]int
+	mu              sync.Mutex
+	active          map[string]int
+	consumedTickets map[string]time.Time
 }
 
 func main() {
@@ -84,6 +92,7 @@ func main() {
 		config: cfg,
 		logger: slog.Default(),
 		active: make(map[string]int),
+		consumedTickets: make(map[string]time.Time),
 		dialer: websocket.Dialer{
 			HandshakeTimeout: targetConnectTimeout,
 			EnableCompression: false,
@@ -267,7 +276,14 @@ func (service *relayService) handleRelay(response http.ResponseWriter, request *
 		http.Error(response, "Origin is not allowed.", http.StatusForbidden)
 		return
 	}
-	principal, ok := service.authorize(request.URL.Query().Get("key"))
+	// Kitty's normal account-gated route supplies a short-lived `ticket`.
+	// Keep `key` as a legacy external-relay fallback, but never use either to
+	// transport a partner TOTP or its signing secret.
+	credential := request.URL.Query().Get("ticket")
+	if credential == "" {
+		credential = request.URL.Query().Get("key")
+	}
+	principal, ok := service.authorize(credential)
 	if !ok {
 		http.Error(response, "Invalid relay credential.", http.StatusUnauthorized)
 		return
@@ -314,7 +330,18 @@ func (service *relayService) authorize(rawCredential string) (relayPrincipal, bo
 		return relayPrincipal{}, false
 	}
 	var claims relayTokenClaims
-	if err := json.Unmarshal(payload, &claims); err != nil || claims.Audience != "kitty-vps-relay" || strings.TrimSpace(claims.Subject) == "" || claims.ExpiresAt <= time.Now().Unix() {
+	if err := json.Unmarshal(payload, &claims); err != nil || strings.TrimSpace(claims.Subject) == "" {
+		return relayPrincipal{}, false
+	}
+	now := time.Now()
+	// Kitty account-service tickets use Date.now(), while the original Go
+	// bridge format used seconds. Both are finite int64 values, so normalize
+	// only values that clearly carry milliseconds.
+	expiresAt := time.Unix(claims.ExpiresAt, 0)
+	if claims.ExpiresAt > 10_000_000_000 {
+		expiresAt = time.UnixMilli(claims.ExpiresAt)
+	}
+	if !expiresAt.After(now) || expiresAt.After(now.Add(10*time.Minute)) {
 		return relayPrincipal{}, false
 	}
 	maxTunnels := claims.MaxTunnels
@@ -322,10 +349,26 @@ func (service *relayService) authorize(rawCredential string) (relayPrincipal, bo
 		return relayPrincipal{}, false
 	}
 	subjectHash := sha256.Sum256([]byte(claims.Subject))
-	return relayPrincipal{
-		identity:   "token:" + base64.RawURLEncoding.EncodeToString(subjectHash[:12]),
-		maxTunnels: maxTunnels,
-	}, true
+	principal := relayPrincipal{
+		identity:      "token:" + base64.RawURLEncoding.EncodeToString(subjectHash[:12]),
+		maxTunnels:    maxTunnels,
+		ticketExpires: expiresAt,
+	}
+	// The modern account-service format binds the ticket to this bridge and
+	// includes a nonce. Its fingerprint is held only in memory until expiry so
+	// a copied URL cannot open another tunnel. This is transient replay
+	// protection, not user-data storage.
+	if claims.Type == "kitty-bot-relay" && claims.Audience == "kitty-bot-relay" && len(claims.Nonce) >= 16 {
+		ticketHash := sha256.Sum256([]byte(rawCredential))
+		principal.ticketID = base64.RawURLEncoding.EncodeToString(ticketHash[:])
+		return principal, true
+	}
+	// Compatibility for the previous VPS-only ticket format. New deployments
+	// should use the account-service ticket above.
+	if claims.Type == "" && claims.Audience == "kitty-vps-relay" {
+		return principal, true
+	}
+	return relayPrincipal{}, false
 }
 
 func constantTimeEqual(got, expected string) bool {
@@ -338,8 +381,22 @@ func constantTimeEqual(got, expected string) bool {
 func (service *relayService) reserve(principal relayPrincipal) bool {
 	service.mu.Lock()
 	defer service.mu.Unlock()
+	now := time.Now()
+	for ticketID, expiresAt := range service.consumedTickets {
+		if !expiresAt.After(now) {
+			delete(service.consumedTickets, ticketID)
+		}
+	}
+	if principal.ticketID != "" {
+		if _, used := service.consumedTickets[principal.ticketID]; used {
+			return false
+		}
+	}
 	if service.active[principal.identity] >= principal.maxTunnels {
 		return false
+	}
+	if principal.ticketID != "" {
+		service.consumedTickets[principal.ticketID] = principal.ticketExpires
 	}
 	service.active[principal.identity]++
 	return true
